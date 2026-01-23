@@ -59,7 +59,11 @@ python Silky.py
 
 ```
 =====================================
-WEB CRAWLER
+SILKY     By Lil Skittle
+  / _ \
+\_\(_)/_/
+ _//o\\_ 
+  /   \
 =====================================
 
 Enter mode (crawl / host / import / importfile): crawl
