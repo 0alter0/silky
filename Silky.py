@@ -45,7 +45,6 @@ except ImportError:
 
 
 class LogLevel(Enum):
-    """Custom log levels for granular control"""
     DEBUG = logging.DEBUG
     API = 25
     NETWORK = 26
@@ -60,7 +59,6 @@ logging.addLevelName(LogLevel.NETWORK.value, "NETWORK")
 
 
 class CrawlLogger:
-    """Comprehensive logging system for web crawler"""
     
     def __init__(self, log_dir="crawl_logs"):
         self.log_dir = log_dir
@@ -82,7 +80,6 @@ class CrawlLogger:
         self._setup_handlers()
     
     def _setup_handlers(self):
-        """Setup rotating file handlers for different log types"""
         for log_type in self.logs.keys():
             filename = os.path.join(self.log_dir, f"{log_type}_{self.timestamp}.log")
             handler = RotatingFileHandler(filename, maxBytes=10*1024*1024, backupCount=5)
@@ -94,7 +91,6 @@ class CrawlLogger:
             self.handlers[log_type] = handler
     
     def log_api_call(self, endpoint, method, status_code, response_time, data=None):
-        """Log API calls with details"""
         entry = {
             "timestamp": datetime.now().isoformat(),
             "endpoint": endpoint,
@@ -107,7 +103,6 @@ class CrawlLogger:
         print(f"[API] {method} {endpoint} - Status: {status_code} ({response_time:.2f}ms)")
     
     def log_network_event(self, url, method, status, content_type, size, duration):
-        """Log network requests and responses"""
         entry = {
             "timestamp": datetime.now().isoformat(),
             "url": url,
@@ -121,7 +116,6 @@ class CrawlLogger:
         print(f"[NETWORK] {method} {url} - Status: {status} ({size} bytes, {duration:.2f}ms)")
     
     def log_image(self, url, source_page, dimensions=None, format_type=None, file_size=None, alt_text=None):
-        """Enhanced image logging with metadata"""
         entry = {
             "timestamp": datetime.now().isoformat(),
             "url": url,
@@ -136,7 +130,6 @@ class CrawlLogger:
         print(f"[IMAGE] {url[:80]}{dim_str}")
     
     def log_javascript(self, script_url, script_type, page_url, async_load=False, defer_load=False, content_size=None):
-        """Log JavaScript resources loaded on pages"""
         entry = {
             "timestamp": datetime.now().isoformat(),
             "script_url": script_url,
@@ -158,7 +151,6 @@ class CrawlLogger:
             print(f"[INLINE-SCRIPT] {page_url[:60]}...{size_str}")
     
     def log_error(self, error_type, url, message, traceback_info=None):
-        """Log errors with context"""
         entry = {
             "timestamp": datetime.now().isoformat(),
             "type": error_type,
@@ -170,7 +162,6 @@ class CrawlLogger:
         print(f"[ERROR] {error_type} on {url}: {message}")
     
     def log_performance(self, metric_name, value, unit="ms"):
-        """Log performance metrics"""
         entry = {
             "timestamp": datetime.now().isoformat(),
             "metric": metric_name,
@@ -181,7 +172,6 @@ class CrawlLogger:
         print(f"[PERF] {metric_name}: {value} {unit}")
     
     def export_logs(self, filename="crawler_logs.json"):
-        """Export all logs to JSON file"""
         export_data = {
             "export_timestamp": datetime.now().isoformat(),
             "logs": self.logs,
@@ -204,7 +194,6 @@ class CrawlLogger:
             return None
     
     def get_summary(self):
-        """Get summary of all logs"""
         summary = {
             "api_calls": len(self.logs["api"]),
             "network_events": len(self.logs["network"]),
@@ -262,22 +251,8 @@ def get_main_domain(url):
 
 
 class NetworkLoggingConfig:
-    """Configuration for selective network and API logging in Playwright"""
-    
     def __init__(self, enabled=False, log_all=False, url_patterns=None, methods=None, 
                  min_size=0, status_codes=None, exclude_patterns=None):
-        """
-        Initialize network logging config
-        
-        Args:
-            enabled: Whether network logging is enabled
-            log_all: If True, log all requests (overrides patterns)
-            url_patterns: List of URL patterns to match (supports *, regex)
-            methods: List of HTTP methods to log (GET, POST, DELETE, etc.)
-            min_size: Minimum response size in bytes to log (0 = log all)
-            status_codes: List of status codes to log (e.g., [200, 404, 500])
-            exclude_patterns: List of URL patterns to exclude
-        """
         self.enabled = enabled
         self.log_all = log_all
         self.url_patterns = url_patterns or []
@@ -303,7 +278,6 @@ class NetworkLoggingConfig:
                 print(f"Warning: Invalid exclude pattern '{pattern}': {e}")
     
     def should_log(self, url, method, status_code=None, size=0):
-        """Check if this request should be logged"""
         if not self.enabled:
             return False
         
@@ -334,7 +308,6 @@ class NetworkLoggingConfig:
     
     @staticmethod
     def from_user_input():
-        """Create config from user input prompts"""
         print("\n--- NETWORK LOGGING CONFIGURATION ---")
         enable_logging = input("Enable network/API logging? (yes/no) [no]: ").strip().lower()
         
@@ -395,8 +368,6 @@ class NetworkLoggingConfig:
 
 
 class PlaywrightCrawler:
-    """Another web crawler, mainly used for network logging and/or more details"""
-    
     def __init__(self, logger=None, max_depth=0, max_pages=0, on_site_only=False,
                  content_filter=None, url_include=None, url_exclude=None, image_only=False,
                  network_logging_config=None, page_timeout=15000):
@@ -434,7 +405,6 @@ class PlaywrightCrawler:
         }
     
     def should_crawl_url(self, url):
-        """Check if URL should be crawled"""
         if self.on_site_only and get_main_domain(url) not in self.allowed_domains:
             self.stats["skipped"] += 1
             return False
@@ -447,7 +417,6 @@ class PlaywrightCrawler:
         return True
     
     def extract_images_from_page(self, page: Page, url: str):
-        """Enhanced image extraction with metadata logging"""
         images = []
         
         try:
@@ -523,7 +492,6 @@ class PlaywrightCrawler:
         return images
     
     def extract_javascript_from_page(self, page: Page, url: str):
-        """Extract and log all JavaScript loaded on the page"""
         scripts = []
         
         try:
@@ -622,8 +590,6 @@ class PlaywrightCrawler:
         return scripts
     
     def crawl_page(self, page: Page, url: str, depth: int = 0):
-        """Crawl a single page with enhanced logging"""
-        
         if url in self.visited or (self.max_pages > 0 and self.stats["pages_crawled"] >= self.max_pages):
             return
         
@@ -712,7 +678,6 @@ class PlaywrightCrawler:
             self.logger.log_error("PageCrawl", url, str(e))
     
     def run(self, start_urls):
-        """Run the Playwright crawler"""
         if not PLAYWRIGHT_AVAILABLE:
             print("Playwright is not installed. Run: pip install playwright")
             return None
@@ -728,7 +693,6 @@ class PlaywrightCrawler:
                 )
                 
                 def log_request(request):
-                    """Log request details - fires on request (may not have response yet)"""
                     try:
                         response = request.response()
                         if response:
@@ -750,7 +714,6 @@ class PlaywrightCrawler:
                         pass
                 
                 def log_response(response):
-                    """Log response details with actual data"""
                     try:
                         method = response.request.method
                         url = response.url
@@ -815,13 +778,6 @@ def send_discord_message(content=None, embed=None, file_content=None, filename=N
 
 # Gotta make a seperate script to quickly copy all cookies from the site (JS)
 def parse_cookies(cookie_string):
-    """
-    Parse cookie string into a dictionary format that Scrapy can use.
-    Supports formats:
-    - name1=value1; name2=value2
-    - name1=value1, name2=value2
-    - JSON format: {"name1": "value1", "name2": "value2"}
-    """
     if not cookie_string or cookie_string.strip() == "":
         return {}
     
@@ -881,7 +837,6 @@ class SearchSpider(scrapy.Spider):
             crawl_stats["images_found"] = 0
 
     def start_requests(self):
-        """Override to add cookies to initial requests"""
         for url in self.start_urls:
             yield scrapy.Request(url, callback=self.parse, cookies=self.cookies, 
                                cb_kwargs={'depth': 0}, errback=self.handle_error)
@@ -1599,7 +1554,6 @@ def export_data(to_file=False, filename="exported_data.dat"):
             print("Clipboard copy unavailable.")
 
 def export_urls_to_file(filename="links.txt"):
-    """Exports all collected URLs to a text file, one URL per line."""
     if not collected_data:
         print("No data collected to export.")
         return
@@ -1619,7 +1573,6 @@ def export_urls_to_file(filename="links.txt"):
         print(f"Error writing to file '{filename}': {e}")
 
 def export_images_to_file(filename="images.txt"):
-    """Exports all collected image URLs to a text file, one URL per line."""
     if not collected_data:
         print("No data collected to export.")
         return
@@ -1646,7 +1599,6 @@ def export_images_to_file(filename="images.txt"):
 
 
 def export_images_with_metadata(filename="images_metadata.json"):
-    """Exports all collected images with metadata (dimensions, alt text, source, etc.)"""
     if not collected_data:
         print("No data collected to export.")
         return
