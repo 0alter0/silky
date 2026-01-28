@@ -10,7 +10,7 @@ import base64
 import os
 import re
 import requests
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from datetime import datetime
 import multiprocessing
 import time
@@ -18,6 +18,7 @@ from io import BytesIO
 import logging
 from logging.handlers import RotatingFileHandler
 from enum import Enum
+import heapq
 
 # Playwright
 try:
@@ -27,10 +28,6 @@ except ImportError:
     PLAYWRIGHT_AVAILABLE = False
 
 # --- CONFIGURATION ---
-# Ts not needed anymore lol
-APPS_SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzzLoNPs7JtcXgeBjLv3VslIyRP7SE7I3SKL6hfGKdxbp58tROetamXW6R5DPK_ttcA/exec" 
-# ---------------------
-
 try:
     import discord
     DISCORD_LIB_AVAILABLE = True
@@ -60,7 +57,7 @@ logging.addLevelName(LogLevel.NETWORK.value, "NETWORK")
 
 class CrawlLogger:
     
-    def __init__(self, log_dir="crawl_logs"):
+    def __init__(self, log_dir="crawl_logs", log_images=True, log_scripts=True, log_cookies=True):
         self.log_dir = log_dir
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
@@ -72,9 +69,15 @@ class CrawlLogger:
             "network": [],
             "images": [],
             "javascript": [],
+            "cookies": [],
             "errors": [],
-            "performance": []
+            "performance": [],
+            "pages": []
         }
+        
+        self.log_images_enabled = log_images
+        self.log_scripts_enabled = log_scripts
+        self.log_cookies_enabled = log_cookies
         
         self.handlers = {}
         self._setup_handlers()
@@ -90,6 +93,15 @@ class CrawlLogger:
             handler.setFormatter(formatter)
             self.handlers[log_type] = handler
     
+    def _write_log(self, log_type, message, level=logging.INFO):
+        """Write a log message to both the in-memory log and the file handler"""
+        if log_type in self.handlers:
+            logger = logging.getLogger(f"CrawlLogger.{log_type}")
+            logger.setLevel(logging.DEBUG)
+            if not logger.handlers:
+                logger.addHandler(self.handlers[log_type])
+            logger.log(level, message)
+    
     def log_api_call(self, endpoint, method, status_code, response_time, data=None):
         entry = {
             "timestamp": datetime.now().isoformat(),
@@ -100,7 +112,9 @@ class CrawlLogger:
             "data_size": len(json.dumps(data)) if data else 0
         }
         self.logs["api"].append(entry)
-        print(f"[API] {method} {endpoint} - Status: {status_code} ({response_time:.2f}ms)")
+        message = f"{method} {endpoint} - Status: {status_code} ({response_time:.2f}ms)"
+        self._write_log("api", message, LogLevel.API.value)
+        print(f"[API] {message}")
     
     def log_network_event(self, url, method, status, content_type, size, duration):
         entry = {
@@ -113,9 +127,13 @@ class CrawlLogger:
             "duration_ms": duration
         }
         self.logs["network"].append(entry)
-        print(f"[NETWORK] {method} {url} - Status: {status} ({size} bytes, {duration:.2f}ms)")
+        message = f"{method} {url} - Status: {status} ({size} bytes, {duration:.2f}ms)"
+        self._write_log("network", message, LogLevel.NETWORK.value)
+        print(f"[NETWORK] {message}")
     
     def log_image(self, url, source_page, dimensions=None, format_type=None, file_size=None, alt_text=None):
+        if not self.log_images_enabled:
+            return
         entry = {
             "timestamp": datetime.now().isoformat(),
             "url": url,
@@ -127,9 +145,13 @@ class CrawlLogger:
         }
         self.logs["images"].append(entry)
         dim_str = f" ({dimensions[0]}x{dimensions[1]})" if dimensions else ""
-        print(f"[IMAGE] {url[:80]}{dim_str}")
+        message = f"{url}{dim_str} from {source_page}"
+        self._write_log("images", message)
+        print(f"[IMAGE] {url}{dim_str}")
     
     def log_javascript(self, script_url, script_type, page_url, async_load=False, defer_load=False, content_size=None):
+        if not self.log_scripts_enabled:
+            return
         entry = {
             "timestamp": datetime.now().isoformat(),
             "script_url": script_url,
@@ -142,13 +164,16 @@ class CrawlLogger:
         self.logs["javascript"].append(entry)
         
         if script_type == "external":
-            script_display = script_url[:80]
             async_str = " [async]" if async_load else ""
             defer_str = " [defer]" if defer_load else ""
-            print(f"[SCRIPT] {script_display}{async_str}{defer_str}")
+            message = f"External: {script_url}{async_str}{defer_str} from {page_url}"
+            self._write_log("javascript", message)
+            print(f"[SCRIPT] {script_url}{async_str}{defer_str}")
         else:
             size_str = f" ({content_size} bytes)" if content_size else ""
-            print(f"[INLINE-SCRIPT] {page_url[:60]}...{size_str}")
+            message = f"Inline: {page_url}{size_str}"
+            self._write_log("javascript", message)
+            print(f"[INLINE-SCRIPT] {page_url}{size_str}")
     
     def log_error(self, error_type, url, message, traceback_info=None):
         entry = {
@@ -159,7 +184,9 @@ class CrawlLogger:
             "traceback": traceback_info
         }
         self.logs["errors"].append(entry)
-        print(f"[ERROR] {error_type} on {url}: {message}")
+        log_message = f"{error_type} on {url}: {message}"
+        self._write_log("errors", log_message, logging.ERROR)
+        print(f"[ERROR] {log_message}")
     
     def log_performance(self, metric_name, value, unit="ms"):
         entry = {
@@ -169,7 +196,33 @@ class CrawlLogger:
             "unit": unit
         }
         self.logs["performance"].append(entry)
-        print(f"[PERF] {metric_name}: {value} {unit}")
+        message = f"{metric_name}: {value} {unit}"
+        self._write_log("performance", message)
+        print(f"[PERF] {message}")
+
+    def log_cookies(self, url, cookies):
+        if not self.log_cookies_enabled:
+            return
+        
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "page_url": url,
+            "cookies": cookies
+        }
+        self.logs["cookies"].append(entry)
+        message = f"Found {len(cookies)} cookies on {url}: {[c.get('name', 'unknown') for c in cookies]}"
+        self._write_log("cookies", message)
+        print(f"[COOKIES] Found {len(cookies)} cookies on {url}")
+
+    def log_page_visit(self, url, title=None):
+        entry = {
+            "timestamp": datetime.now().isoformat(),
+            "url": url,
+            "title": title
+        }
+        self.logs["pages"].append(entry)
+        message = f"Visited: {url} - Title: {title or 'No title'}"
+        self._write_log("pages", message)
     
     def export_logs(self, filename="crawler_logs.json"):
         export_data = {
@@ -179,8 +232,11 @@ class CrawlLogger:
                 "total_api_calls": len(self.logs["api"]),
                 "total_network_events": len(self.logs["network"]),
                 "total_images": len(self.logs["images"]),
+                "total_js_logs": len(self.logs["javascript"]),
+                "total_cookie_logs": len(self.logs["cookies"]),
                 "total_errors": len(self.logs["errors"]),
-                "performance_metrics": len(self.logs["performance"])
+                "performance_metrics": len(self.logs["performance"]),
+                "total_webpages_visited": len(self.logs["pages"])
             }
         }
         
@@ -188,10 +244,19 @@ class CrawlLogger:
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(export_data, f, indent=2, ensure_ascii=False)
             print(f"Logs exported to {filename}")
+            
+            self.close_handlers()
+            
             return filename
         except Exception as e:
             print(f"Error exporting logs: {e}")
             return None
+    
+    def close_handlers(self):
+        """Close all file handlers to ensure logs are flushed to disk"""
+        for log_type, handler in self.handlers.items():
+            handler.flush()
+            handler.close()
     
     def get_summary(self):
         summary = {
@@ -218,7 +283,8 @@ DEFAULT_PARAMS = {
     "include_pattern": None,
     "exclude_pattern": None,
     "file_type": None,
-    "image_only": False
+    "image_only": False,
+    "proxy": None
 }
 
 
@@ -233,7 +299,8 @@ crawl_stats = {
     "inbound_links": Counter(),
     "content_types": Counter(),
     "broken_links": [],
-    "images_found": 0
+    "images_found": 0,
+    "path_map": defaultdict(list)
 }
 
 discord_config = {
@@ -367,11 +434,255 @@ class NetworkLoggingConfig:
         return config
 
 
+class JSRunner:
+    """
+    Framework for running custom JavaScript on every crawled page.
+    Provides access to Silky's logger, stats, and crawler state.
+    """
+    
+    def __init__(self, script=None, script_file=None, on_page_load=None, on_data_found=None):
+        """
+        Initialize JS Runner with script or callback functions.
+        
+        Args:
+            script: JavaScript code as string
+            script_file: Path to .js file to load
+            on_page_load: Python callback function(url, page, context) -> None
+            on_data_found: Python callback function(url, data, context) -> None
+        """
+        self.script = script
+        self.script_file = script_file
+        self.on_page_load = on_page_load
+        self.on_data_found = on_data_found
+        self.results = []
+        
+        if script_file and not script:
+            try:
+                with open(script_file, 'r', encoding='utf-8') as f:
+                    self.script = f.read()
+            except Exception as e:
+                print(f"[JS RUNNER] Failed to load script file: {e}")
+    
+    def build_context(self, crawler, url, page):
+        """
+        Build the context object that JS can interact with.
+        Provides access to Silky's internals.
+        """
+        return {
+            'url': url,
+            'title': page.title() if page else '',
+            
+            'pages_crawled': crawler.stats.get('pages_crawled', 0),
+            'errors': crawler.stats.get('errors', 0),
+            'images_found': crawler.stats.get('images_found', 0),
+            
+            'visited': list(crawler.visited),
+            'visited_count': len(crawler.visited),
+            
+            'collected_count': len(crawler.collected_data),
+            
+            'can_log': True,
+        }
+    
+    def inject_silky_api(self, page, context):
+        """
+        Inject Silky API into page's window object so JS can interact with crawler.
+        """
+        api_script = f"""
+        window.Silky = {{
+            context: {json.dumps(context)},
+            
+            results: [],
+            
+            log: function(message) {{
+                console.log('[SILKY]', message);
+                this.results.push({{
+                    type: 'log',
+                    message: message,
+                    timestamp: new Date().toISOString()
+                }});
+            }},
+            
+            warn: function(message) {{
+                console.warn('[SILKY]', message);
+                this.results.push({{
+                    type: 'warn',
+                    message: message,
+                    timestamp: new Date().toISOString()
+                }});
+            }},
+            
+            error: function(message) {{
+                console.error('[SILKY]', message);
+                this.results.push({{
+                    type: 'error',
+                    message: message,
+                    timestamp: new Date().toISOString()
+                }});
+            }},
+            
+            collect: function(data) {{
+                this.results.push({{
+                    type: 'data',
+                    data: data,
+                    timestamp: new Date().toISOString()
+                }});
+            }},
+            
+            countElements: function(selector) {{
+                return document.querySelectorAll(selector).length;
+            }},
+            
+            extractText: function(selector) {{
+                const elements = document.querySelectorAll(selector);
+                return Array.from(elements).map(el => el.textContent.trim());
+            }},
+            
+            extractAttributes: function(selector, attribute) {{
+                const elements = document.querySelectorAll(selector);
+                return Array.from(elements).map(el => el.getAttribute(attribute));
+            }},
+            
+            extractLinks: function(selector = 'a[href]') {{
+                const links = document.querySelectorAll(selector);
+                return Array.from(links).map(a => a.href);
+            }},
+            
+            waitForElement: function(selector, timeout = 5000) {{
+                return new Promise((resolve, reject) => {{
+                    const element = document.querySelector(selector);
+                    if (element) {{
+                        resolve(element);
+                        return;
+                    }}
+                    
+                    const observer = new MutationObserver(() => {{
+                        const element = document.querySelector(selector);
+                        if (element) {{
+                            observer.disconnect();
+                            resolve(element);
+                        }}
+                    }});
+                    
+                    observer.observe(document.body, {{
+                        childList: true,
+                        subtree: true
+                    }});
+                    
+                    setTimeout(() => {{
+                        observer.disconnect();
+                        reject(new Error('Element not found: ' + selector));
+                    }}, timeout);
+                }});
+            }},
+            
+            exists: function(selector) {{
+                return document.querySelector(selector) !== null;
+            }},
+            
+            getMeta: function() {{
+                const meta = {{}};
+                document.querySelectorAll('meta').forEach(m => {{
+                    const name = m.getAttribute('name') || m.getAttribute('property');
+                    const content = m.getAttribute('content');
+                    if (name && content) meta[name] = content;
+                }});
+                return meta;
+            }},
+            
+            stopCrawl: function(reason) {{
+                this.results.push({{
+                    type: 'stop',
+                    reason: reason,
+                    timestamp: new Date().toISOString()
+                }});
+            }},
+            
+            skipUrl: function(url, reason) {{
+                this.results.push({{
+                    type: 'skip',
+                    url: url,
+                    reason: reason,
+                    timestamp: new Date().toISOString()
+                }});
+            }}
+        }};
+        """
+        
+        try:
+            page.evaluate(api_script)
+            return True
+        except Exception as e:
+            print(f"[JS RUNNER] Failed to inject Silky API: {e}")
+            return False
+    
+    def execute(self, page, crawler, url):
+        """
+        Execute the JS Runner script on the current page.
+        """
+        if not self.script and not self.on_page_load:
+            return None
+        
+        try:
+            context = self.build_context(crawler, url, page)
+            
+            if not self.inject_silky_api(page, context):
+                return None
+            
+            if self.script:
+                result = page.evaluate(self.script)
+            else:
+                result = None
+            
+            if self.on_page_load:
+                try:
+                    self.on_page_load(url, page, context)
+                except Exception as e:
+                    print(f"[JS RUNNER] on_page_load callback error: {e}")
+            
+            silky_results = page.evaluate("window.Silky.results")
+            
+            for item in silky_results:
+                item['url'] = url
+                self.results.append(item)
+                
+                if item['type'] == 'log':
+                    print(f"[JS→SILKY] {item['message']}")
+                elif item['type'] == 'error':
+                    print(f"[JS→ERROR] {item['message']}")
+                    crawler.logger.log_error("JSRunner", url, item['message'])
+                elif item['type'] == 'data':
+                    if self.on_data_found:
+                        try:
+                            self.on_data_found(url, item['data'], context)
+                        except Exception as e:
+                            print(f"[JS RUNNER] on_data_found callback error: {e}")
+                elif item['type'] == 'stop':
+                    print(f"[JS→STOP] {item['reason']}")
+                    crawler.stop_on_reached = True
+            
+            return {
+                'script_result': result,
+                'silky_results': silky_results,
+                'url': url
+            }
+            
+        except Exception as e:
+            print(f"[JS RUNNER] Execution error on {url}: {e}")
+            crawler.logger.log_error("JSRunner", url, str(e))
+            return None
+
+
 class PlaywrightCrawler:
     def __init__(self, logger=None, max_depth=0, max_pages=0, on_site_only=False,
                  content_filter=None, url_include=None, url_exclude=None, image_only=False,
-                 network_logging_config=None, page_timeout=15000):
-        self.logger = logger or CrawlLogger()
+                 network_logging_config=None, page_timeout=15000, proxy=None, cookies=None,
+                 log_images=True, log_scripts=True, log_cookies=True, global_crawl_stats=None,
+                 force_domain=None, stop_on_url=None, js_runner=None):
+        self.logger = logger or CrawlLogger(log_images=log_images, log_scripts=log_scripts, log_cookies=log_cookies)
+        self.logger.log_images_enabled = log_images
+        self.logger.log_scripts_enabled = log_scripts
+        self.logger.log_cookies_enabled = log_cookies
         self.max_depth = max_depth
         self.max_pages = max_pages
         self.on_site_only = on_site_only
@@ -381,28 +692,78 @@ class PlaywrightCrawler:
         self.image_only = image_only
         self.network_logging_config = network_logging_config or NetworkLoggingConfig(enabled=False)
         self.page_timeout = page_timeout  # in milliseconds!!!!
+        self.proxy = proxy
+        self.initial_cookies = cookies or {}
+        
+        self.force_domain = force_domain 
+        self.force_domain_parsed = None
+        if self.force_domain:
+            self.force_domain_parsed = self._parse_force_domain(force_domain)
+        
+        self.stop_on_url = stop_on_url
+        self.stop_on_reached = False
+        self.stop_on_smart = stop_on_url is not None 
+        
+        self.link_queue = []
+        
+        self.js_runner = js_runner  
+        self.js_runner_enabled = js_runner is not None
+        self.js_runner_results = []  
         
         self.visited = set()
         self.collected_data = []
         self.start_url = None
         self.allowed_domains = []
         
-        self.stats = {
-            "pages_crawled": 0,
-            "images_found": 0,
-            "errors": 0,
-            "skipped": 0,
-            "start_time": datetime.now(),
-            "network_requests": [],
-            "api_calls": [],
-            "images": [],
-            "javascript": {
-                "external_scripts": [],
-                "inline_scripts": [],
-                "total_external": 0,
-                "total_inline": 0
+        if global_crawl_stats:
+            self.stats = global_crawl_stats
+            if "start_time" not in self.stats or self.stats["start_time"] is None:
+                self.stats["start_time"] = datetime.now()
+            if "images" not in self.stats:
+                self.stats["images"] = []
+            if "javascript" not in self.stats:
+                self.stats["javascript"] = {
+                    "external_scripts": [],
+                    "inline_scripts": [],
+                    "total_external": 0,
+                    "total_inline": 0
+                }
+            if "network_requests" not in self.stats:
+                self.stats["network_requests"] = []
+            if "api_calls" not in self.stats:
+                self.stats["api_calls"] = []
+            if "content_types" not in self.stats:
+                self.stats["content_types"] = Counter()
+            if "link_map" not in self.stats:
+                self.stats["link_map"] = defaultdict(list)
+            if "inbound_links" not in self.stats:
+                self.stats["inbound_links"] = Counter()
+            if "broken_links" not in self.stats:
+                self.stats["broken_links"] = []
+            if "path_map" not in self.stats:
+                self.stats["path_map"] = defaultdict(list)
+        else:
+            self.stats = {
+                "pages_crawled": 0,
+                "images_found": 0,
+                "errors": 0,
+                "skipped": 0,
+                "start_time": datetime.now(),
+                "network_requests": [],
+                "api_calls": [],
+                "images": [],
+                "content_types": Counter(),
+                "link_map": defaultdict(list),
+                "inbound_links": Counter(),
+                "broken_links": [],
+                "path_map": defaultdict(list),
+                "javascript": {
+                    "external_scripts": [],
+                    "inline_scripts": [],
+                    "total_external": 0,
+                    "total_inline": 0
+                }
             }
-        }
     
     def should_crawl_url(self, url):
         if self.on_site_only and get_main_domain(url) not in self.allowed_domains:
@@ -414,21 +775,139 @@ class PlaywrightCrawler:
         if self.url_exclude and self.url_exclude.search(url):
             self.stats["skipped"] += 1
             return False
+        
+        if self.force_domain_parsed and not self._matches_force_domain(url):
+            self.stats["skipped"] += 1
+            return False
+        
         return True
     
-    def extract_images_from_page(self, page: Page, url: str):
-        images = []
+    def _parse_force_domain(self, pattern):
+        """
+        Parse force_domain pattern to extract constraints.
+        Examples:
+          - "https://test.example.com/guide/*" -> stay on test.example.com under /guide/
+          - "https://example.com/*" -> stay on example.com
+          - "https://*.example.com/*" -> stay on any subdomain of example.com
+        """
+        parsed = urlparse(pattern)
         
+        scheme = parsed.scheme if parsed.scheme else 'https'
+        netloc = parsed.netloc
+        path_pattern = parsed.path
+        
+        if '*' in netloc:
+            netloc_regex = netloc.replace('.', r'\.').replace('*', r'[^.]+')
+            netloc_regex = f'^{netloc_regex}$'
+        else:
+            netloc_regex = None
+        
+        if '*' in path_pattern:
+            path_regex = path_pattern.replace('*', '.*')
+            path_regex = f'^{path_regex}$'
+        else:
+            path_regex = None
+        
+        return {
+            'scheme': scheme,
+            'netloc': netloc,
+            'netloc_regex': netloc_regex,
+            'path_pattern': path_pattern,
+            'path_regex': path_regex
+        }
+    
+    def _matches_force_domain(self, url):
+        """Check if URL matches the force_domain pattern."""
+        if not self.force_domain_parsed:
+            return True
+        
+        parsed_url = urlparse(url)
+        config = self.force_domain_parsed
+        
+        if config['scheme'] and parsed_url.scheme != config['scheme']:
+            return False
+        
+        if config['netloc_regex']:
+            if not re.match(config['netloc_regex'], parsed_url.netloc):
+                return False
+        else:
+            if parsed_url.netloc != config['netloc']:
+                return False
+        
+        if config['path_regex']:
+            if not re.match(config['path_regex'], parsed_url.path):
+                return False
+        elif config['path_pattern'] and config['path_pattern'] != '/' and config['path_pattern'] != '/*':
+            if not parsed_url.path.startswith(config['path_pattern'].rstrip('*')):
+                return False
+        
+        return True
+    
+    def _calculate_link_score(self, link_url, current_url):
+        """
+        Calculate priority score for a link when stop_on_url is set.
+        Higher scores = higher priority = crawled first.
+        
+        Scoring rules (ported from scraper.py smart scoring):
+        +100: Link URL contains stop_on_url text
+        +50:  Link is on same domain as stop_on_url
+        +5:   Link stays on current domain
+        -10:  Link is to irrelevant pages (about, terms, privacy, etc.)
+        """
+        if not self.stop_on_url:
+            return 0
+        
+        score = 0
+        link_url_lower = link_url.lower()
+        stop_on_url_lower = self.stop_on_url.lower()
+        
+        if link_url == self.stop_on_url:
+            return 1000
+        
+        if stop_on_url_lower in link_url_lower:
+            score += 100
+        
+        try:
+            stop_on_domain = urlparse(self.stop_on_url).netloc
+            link_domain = urlparse(link_url).netloc
+            
+            if stop_on_domain and link_domain == stop_on_domain:
+                score += 50
+        except:
+            pass
+        
+        try:
+            current_domain = urlparse(current_url).netloc
+            link_domain = urlparse(link_url).netloc
+            
+            if current_domain and link_domain == current_domain:
+                score += 5
+        except:
+            pass
+        
+        irrelevant_keywords = [
+            "about", "terms", "privacy", "policy", "cookie", 
+            "legal", "disclaimer", "contact", "sitemap", "help"
+        ]
+        
+        if any(keyword in link_url_lower for keyword in irrelevant_keywords):
+            score -= 10
+        
+        return score
+    
+    def extract_images_from_page(self, page: Page, url: str):
+        img_list = []
+
         try:
             img_elements = page.query_selector_all('img')
             for img in img_elements:
                 img_url = img.get_attribute('src') or img.get_attribute('data-src')
                 if not img_url:
                     continue
-                
+
                 img_url = urljoin(url, img_url)
                 alt_text = img.get_attribute('alt')
-                
+
                 width = img.get_attribute('width')
                 height = img.get_attribute('height')
                 dimensions = None
@@ -437,22 +916,22 @@ class PlaywrightCrawler:
                         dimensions = (int(width), int(height))
                     except ValueError:
                         pass
-                
-                images.append({
+
+                img_list.append({
                     "url": img_url,
                     "type": "img_tag",
                     "alt": alt_text,
                     "dimensions": dimensions
                 })
-                
+
                 self.logger.log_image(img_url, url, dimensions=dimensions, alt_text=alt_text)
-        
+
         except Exception as e:
             self.logger.log_error("ImageExtraction", url, str(e))
-        
+
         try:
             css_images = page.evaluate(r"""() => {
-                const images = [];
+                const bgImages = [];
                 try {
                     document.querySelectorAll('*').forEach(el => {
                         try {
@@ -461,7 +940,7 @@ class PlaywrightCrawler:
                             if (bgImage && bgImage !== 'none') {
                                 const match = bgImage.match(/url\(["\']?([^"\')]+)["\']?\)/);
                                 if (match && match[1]) {
-                                    images.push(match[1]);
+                                    bgImages.push(match[1]);
                                 }
                             }
                         } catch (e) {
@@ -471,25 +950,29 @@ class PlaywrightCrawler:
                 } catch (e) {
                     // Return whatever we found so far
                 }
-                return images;
+                return bgImages;
             }""")
-            
+
             for img_url in css_images:
                 img_url = urljoin(url, img_url)
-                images.append({
+                img_list.append({
                     "url": img_url,
                     "type": "css_background",
                     "alt": None,
                     "dimensions": None
                 })
                 self.logger.log_image(img_url, url, format_type="css_background")
-        
+
         except Exception as e:
             self.logger.log_error("CSSImageExtraction", url, str(e))
+
+        self.stats["images_found"] += len(img_list)
         
-        self.stats["images_found"] += len(images)
-        self.stats["images"].extend(images)
-        return images
+        if "images" not in self.stats:
+            self.stats["images"] = []
+        self.stats["images"].extend(img_list)
+        
+        return img_list
     
     def extract_javascript_from_page(self, page: Page, url: str):
         scripts = []
@@ -522,10 +1005,13 @@ class PlaywrightCrawler:
                 }
                 return scripts;
             }""")
-            
+
+            if not isinstance(script_data, list):
+                script_data = []
+
             external_scripts = []
             inline_scripts = []
-            
+
             for script_info in script_data or []:
                 if script_info['src']:
                     script_url = urljoin(url, script_info['src'])
@@ -568,7 +1054,7 @@ class PlaywrightCrawler:
                             content_size=script_info['content_length']
                         )
             
-            if not hasattr(self.stats, 'javascript'):
+            if "javascript" not in self.stats:
                 self.stats["javascript"] = {
                     "external_scripts": [],
                     "inline_scripts": [],
@@ -589,28 +1075,106 @@ class PlaywrightCrawler:
         
         return scripts
     
-    def crawl_page(self, page: Page, url: str, depth: int = 0):
-        if url in self.visited or (self.max_pages > 0 and self.stats["pages_crawled"] >= self.max_pages):
+    def crawl_page(self, page: Page, url: str, depth: int = 0, path: list = None):
+        if self.stop_on_url and url == self.stop_on_url:
+            self.stop_on_reached = True
+            print(f"[STOP-ON] Reached target URL: {url}")
+            self.logger.log_performance(f"Reached stop-on URL: {url}", 0, "event")
+        
+        if self.stop_on_reached and url != self.stop_on_url:
+            print(f"[STOP-ON] Skipping {url} - stop URL already reached")
             return
         
+        if url in self.visited or (self.max_pages > 0 and self.stats["pages_crawled"] >= self.max_pages):
+            return
+
         if self.max_depth > 0 and depth >= self.max_depth:
             self.stats["skipped"] += 1
             return
-        
+
         if not self.should_crawl_url(url):
             return
         
+        if path is None:
+            path = [url]
+        
+        self.stats["path_map"][url] = path
+
         try:
+            if self.initial_cookies:
+                for name, value in self.initial_cookies.items():
+                    try:
+                        page.context.add_cookies([{
+                            "name": name,
+                            "value": value,
+                            "url": url
+                        }])
+                    except Exception as e:
+                        self.logger.log_error("CookieSetting", url, f"Failed to set cookie {name}: {str(e)}")
+
+            initial_cookies = {}
+            try:
+                initial_cookies_list = page.context.cookies()
+                initial_cookies = {cookie['name']: cookie for cookie in initial_cookies_list}
+            except Exception as e:
+                self.logger.log_error("InitialCookieExtraction", url, str(e))
+
             start_time = time.time()
-            page.goto(url, wait_until='load', timeout=self.page_timeout)
+            response = page.goto(url, wait_until='load', timeout=self.page_timeout)
             load_time = (time.time() - start_time) * 1000
-            
+
             self.visited.add(url)
             self.stats["pages_crawled"] += 1
             
-            self.logger.log_performance(f"Page Load - {url[:40]}...", load_time, "ms")
-            
+            if response:
+                try:
+                    content_type = response.headers.get('content-type', 'unknown')
+                    content_type = content_type.split(';')[0].strip()
+                    self.stats["content_types"][content_type] += 1
+                except Exception as e:
+                    self.stats["content_types"]["unknown"] += 1
+            else:
+                self.stats["content_types"]["unknown"] += 1
+
+            try:
+                final_cookies_list = page.context.cookies()
+                final_cookies = {cookie['name']: cookie for cookie in final_cookies_list}
+
+                new_cookies = []
+                for name, cookie in final_cookies.items():
+                    if name not in initial_cookies:
+                        new_cookies.append(cookie)
+                    elif initial_cookies[name]['value'] != cookie['value']:
+                        new_cookies.append(cookie)
+
+                if new_cookies and self.logger.log_cookies_enabled:
+                    self.logger.log_cookies(url, new_cookies)
+            except Exception as e:
+                self.logger.log_error("CookieExtraction", url, str(e))
+
             title = page.title() or ""
+            self.logger.log_page_visit(url, title=title)
+
+            self.logger.log_performance(f"Page Load - {url}", load_time, "ms")
+            
+            js_runner_result = None
+            if self.js_runner_enabled and self.js_runner:
+                try:
+                    if isinstance(self.js_runner, JSRunner):
+                        js_runner_result = self.js_runner.execute(page, self, url)
+                    elif isinstance(self.js_runner, str):
+                        temp_runner = JSRunner(script=self.js_runner)
+                        js_runner_result = temp_runner.execute(page, self, url)
+                        self.js_runner_results.extend(temp_runner.results)
+                    
+                    if js_runner_result:
+                        self.js_runner_results.append(js_runner_result)
+                        print(f"[JS RUNNER] Executed on {url} - {len(js_runner_result.get('silky_results', []))} results")
+                        
+                except Exception as e:
+                    self.logger.log_error("JSRunnerExecution", url, str(e))
+                    print(f"[JS RUNNER ERROR] {url}: {e}")
+            
             meta_desc = ""
             try:
                 meta_elem = page.query_selector('meta[name="description"]')
@@ -631,47 +1195,98 @@ class PlaywrightCrawler:
                         "dimensions": img["dimensions"]
                     }
                     self.collected_data.append(page_data)
-                
-                print(f"[IMAGES] {len(images)} images | Depth: {depth} | {url}")
-            
+
+                if self.logger.log_images_enabled:
+                    print(f"[IMAGES] {len(images)} images | Depth: {depth} | {url}")
+
             else:
-                text_content = page.evaluate("() => document.body.innerText") or ""
-                
+                try:
+                    text_content = page.evaluate("() => document.body.innerText") or ""
+                except Exception as e:
+                    self.logger.log_error("TextContentExtraction", url, str(e))
+                    text_content = ""
+
                 if self.content_filter and self.content_filter.upper() != 'N/A':
                     if self.content_filter.lower() not in text_content.lower():
                         self.stats["skipped"] += 1
                         return
-                
-                h1_tags = page.evaluate("() => Array.from(document.querySelectorAll('h1')).map(el => el.textContent)")
-                
+
+                try:
+                    h1_tags = page.evaluate("() => Array.from(document.querySelectorAll('h1')).map(el => el.textContent)")
+                except Exception as e:
+                    self.logger.log_error("H1TagsExtraction", url, str(e))
+                    h1_tags = []
+
                 page_data = {
                     "url": url,
-                    "content": text_content[:50000], 
+                    "content": text_content[:50000],
                     "title": title,
                     "meta_description": meta_desc,
                     "h1_tags": h1_tags or [],
                     "depth": depth,
                     "load_time_ms": load_time
                 }
-                
+
                 self.collected_data.append(page_data)
                 print(f"[SCRAPED] {len(self.collected_data)} | Depth: {depth} | {url}")
-                
-                if not self.image_only:
+
+                if self.logger.log_images_enabled:
                     self.extract_images_from_page(page, url)
-                    
+
+                if self.logger.log_scripts_enabled:
                     self.extract_javascript_from_page(page, url)
+
+            try:
+                links = page.evaluate("""() => {
+                    return Array.from(document.querySelectorAll('a[href]'))
+                        .map(a => a.href)
+                        .filter((href, index, self) => self.indexOf(href) === index);
+                }""")
+            except Exception as e:
+                self.logger.log_error("LinksExtraction", url, str(e))
+                links = []
+
+            outgoing_links = []
             
-            links = page.evaluate("""() => {
-                return Array.from(document.querySelectorAll('a[href]'))
-                    .map(a => a.href)
-                    .filter((href, index, self) => self.indexOf(href) === index);
-            }""")
+            if self.stop_on_smart and not self.stop_on_reached:
+                scored_links = []
+                
+                for link_url in links or []:
+                    link_url = urljoin(url, link_url)
+                    outgoing_links.append(link_url)
+                    self.stats["inbound_links"][link_url] += 1
+                    
+                    if link_url not in self.visited and self.should_crawl_url(link_url):
+                        if self.max_depth == 0 or depth + 1 < self.max_depth:
+                            score = self._calculate_link_score(link_url, url)
+                            new_path = path + [link_url]
+                            scored_links.append((score, link_url, depth + 1, new_path))
+                
+                scored_links.sort(key=lambda x: x[0], reverse=True)
+                
+                if scored_links and self.stop_on_url:
+                    print(f"[SMART] Top 3 scored links from {url}:")
+                    for i, (score, link, _, _) in enumerate(scored_links[:3]):
+                        print(f"  {i+1}. Score: {score:4d} | {link}")
+                
+                for score, link_url, link_depth, link_path in scored_links:
+                    heapq.heappush(self.link_queue, (-score, link_url, link_depth, link_path))
             
-            for link_url in links or []:
-                if link_url not in self.visited and self.should_crawl_url(link_url):
-                    if self.max_depth == 0 or depth + 1 < self.max_depth:
-                        self.crawl_page(page, link_url, depth + 1)
+            else:
+                for link_url in links or []:
+                    link_url = urljoin(url, link_url)
+                    outgoing_links.append(link_url)
+                    self.stats["inbound_links"][link_url] += 1
+                    
+                    if self.stop_on_reached:
+                        continue
+                    
+                    if link_url not in self.visited and self.should_crawl_url(link_url):
+                        if self.max_depth == 0 or depth + 1 < self.max_depth:
+                            new_path = path + [link_url]
+                            self.crawl_page(page, link_url, depth + 1, new_path)
+            
+            self.stats["link_map"][url] = outgoing_links
         
         except Exception as e:
             self.stats["errors"] += 1
@@ -687,7 +1302,8 @@ class PlaywrightCrawler:
         
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
+                proxy_settings = {"server": self.proxy} if self.proxy else None
+                browser = p.chromium.launch(headless=True, proxy=proxy_settings)
                 page = browser.new_page(
                     user_agent="Mozilla/5.0 (compatible; PlaywrightCrawler/1.0)"
                 )
@@ -741,8 +1357,27 @@ class PlaywrightCrawler:
                 page.on("response", log_response)
                 
                 urls = start_urls if isinstance(start_urls, list) else [start_urls]
+                
                 for url in urls:
-                    self.crawl_page(page, url, 0)
+                    self.crawl_page(page, url, 0, path=None)
+                
+                if self.stop_on_smart and not self.stop_on_reached:
+                    print(f"\n[SMART] Processing {len(self.link_queue)} queued links by priority...")
+                    
+                    while self.link_queue and not self.stop_on_reached:
+                        neg_score, link_url, link_depth, link_path = heapq.heappop(self.link_queue)
+                        
+                        if link_url in self.visited:
+                            continue
+                        if self.max_pages > 0 and self.stats["pages_crawled"] >= self.max_pages:
+                            break
+                        
+                        self.crawl_page(page, link_url, link_depth, link_path)
+                    
+                    if self.stop_on_reached:
+                        print(f"[SMART] ✓ Target found! Stopped smart crawling.")
+                    else:
+                        print(f"[SMART] Queue exhausted without finding target.")
                 
                 browser.close()
         
@@ -750,10 +1385,13 @@ class PlaywrightCrawler:
             self.logger.log_error("BrowserCrawl", "N/A", str(e))
             self.stats["errors"] += 1
         
+        self.logger.close_handlers()
+        
         return {
             "data": self.collected_data,
             "stats": self.stats,
-            "logs": self.logger.get_summary()
+            "logs": self.logger.get_summary(),
+            "js_runner_results": self.js_runner_results if self.js_runner_enabled else []
         }
 
 
@@ -776,7 +1414,6 @@ def send_discord_message(content=None, embed=None, file_content=None, filename=N
     except Exception as e:
         print(f"Discord webhook failed: {e}")
 
-# Gotta make a seperate script to quickly copy all cookies from the site (JS)
 def parse_cookies(cookie_string):
     if not cookie_string or cookie_string.strip() == "":
         return {}
@@ -802,9 +1439,9 @@ def parse_cookies(cookie_string):
 class SearchSpider(scrapy.Spider):
     name = "search_spider"
 
-    def __init__(self, start_urls=None, on_site_only=False, max_depth=0, max_pages=0, 
-                 content_filter=None, url_include=None, url_exclude=None, file_types=None, 
-                 image_only=False, cookies=None, manager_dict=None, parent_pid=None, *args, **kwargs):
+    def __init__(self, start_urls=None, on_site_only=False, max_depth=0, max_pages=0,
+                 content_filter=None, url_include=None, url_exclude=None, file_types=None,
+                 image_only=False, cookies=None, manager_dict=None, parent_pid=None, logger=None, proxy=None, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.start_urls = start_urls if isinstance(start_urls, list) else [start_urls]
         self.visited = set()
@@ -820,10 +1457,13 @@ class SearchSpider(scrapy.Spider):
         self.cookies = cookies or {}
         self.link_extractor = LinkExtractor()
         self.pages_count = 0
-        self.manager_dict = manager_dict 
-        self.parent_pid = parent_pid 
-        self.local_data = [] 
-        
+        self.manager_dict = manager_dict
+        self.parent_pid = parent_pid
+        self.local_data = []
+        self.crawl_logger = logger or CrawlLogger()
+        self.path_map = {}
+        self.proxy = proxy
+
         if not self.manager_dict:
             global crawl_stats
             crawl_stats["start_time"] = datetime.now()
@@ -838,8 +1478,9 @@ class SearchSpider(scrapy.Spider):
 
     def start_requests(self):
         for url in self.start_urls:
-            yield scrapy.Request(url, callback=self.parse, cookies=self.cookies, 
-                               cb_kwargs={'depth': 0}, errback=self.handle_error)
+            meta = {'proxy': self.proxy} if self.proxy else {}
+            yield scrapy.Request(url, callback=self.parse, cookies=self.cookies,
+                               cb_kwargs={'depth': 0, 'path': [url]}, errback=self.handle_error, meta=meta)
 
     def should_crawl_url(self, url):
         if self.on_site_only and get_main_domain(url) not in self.allowed_domains:
@@ -859,7 +1500,7 @@ class SearchSpider(scrapy.Spider):
                     return False
         return True
 
-    def parse(self, response, depth=0):
+    def parse(self, response, depth=0, path=None):
         url = response.url
         if url in self.visited:
             return
@@ -867,51 +1508,22 @@ class SearchSpider(scrapy.Spider):
         self.pages_count += 1
         crawl_stats["pages_crawled"] += 1
         
+        title = response.css('title::text').get() or ""
+        self.crawl_logger.log_page_visit(url, title=title.strip())
+
+        if path is None:
+            path = [url]
+        self.path_map[url] = path
+
         if self.max_depth > 0 and depth >= self.max_depth:
             crawl_stats["skipped"] += 1
             return
-        
+
         content_type = response.headers.get('Content-Type', b'').decode('utf-8').split(';')[0]
         crawl_stats["content_types"][content_type] += 1
         
         if self.image_only:
-            images = []
-            
-            img_elements = response.css('img')
-            for img_elem in img_elements:
-                img_url = img_elem.css('::attr(src)').get() or img_elem.css('::attr(data-src)').get()
-                if not img_url:
-                    continue
-                
-                full_url = urljoin(response.url, img_url)
-                alt_text = img_elem.css('::attr(alt)').get()
-                width = img_elem.css('::attr(width)').get()
-                height = img_elem.css('::attr(height)').get()
-                
-                dimensions = None
-                if width and height:
-                    try:
-                        dimensions = (int(width), int(height))
-                    except (ValueError, TypeError):
-                        pass
-                
-                images.append({
-                    "url": full_url,
-                    "type": "img_tag",
-                    "alt_text": alt_text,
-                    "dimensions": dimensions
-                })
-            
-            style_images = response.css('*::attr(style)').re(r'url\(["\']?([^"\')]+)["\']?\)')
-            for src in style_images:
-                full_url = urljoin(response.url, src)
-                images.append({
-                    "url": full_url,
-                    "type": "css_background",
-                    "alt_text": None,
-                    "dimensions": None
-                })
-            
+            images = self.extract_and_log_images(response)
             crawl_stats["images_found"] += len(images)
             
             for img_data in images:
@@ -940,9 +1552,11 @@ class SearchSpider(scrapy.Spider):
                 crawl_stats["skipped"] += 1
                 return
                 
-            title = response.css('title::text').get() or ""
             meta_desc = response.css('meta[name="description"]::attr(content)').get() or ""
             h1_tags = response.css('h1::text').getall()
+
+            images = self.extract_and_log_images(response)
+            crawl_stats["images_found"] += len(images)
 
             page_data = {
                 "url": url,
@@ -951,7 +1565,8 @@ class SearchSpider(scrapy.Spider):
                 "meta_description": meta_desc.strip(),
                 "h1_tags": h1_tags,
                 "depth": depth,
-                "content_type": content_type
+                "content_type": content_type,
+                "images": [img['url'] for img in images]
             }
 
             if not self.manager_dict:
@@ -975,13 +1590,56 @@ class SearchSpider(scrapy.Spider):
             max_depth_check = self.max_depth > 0 and depth + 1 >= self.max_depth
             
             if link_url not in self.visited and self.should_crawl_url(link_url) and not max_depth_check:
+                meta = {'proxy': self.proxy} if self.proxy else {}
                 yield scrapy.Request(link_url, callback=self.parse, cookies=self.cookies,
-                                   cb_kwargs={'depth': depth+1}, errback=self.handle_error, dont_filter=False)
+                                   cb_kwargs={'depth': depth+1, 'path': path + [link_url]}, errback=self.handle_error, dont_filter=False, meta=meta)
             
             elif max_depth_check:
                 crawl_stats["skipped"] += 1
 
         crawl_stats["link_map"][url] = outgoing_links
+
+    def extract_and_log_images(self, response):
+        images = []
+        
+        img_elements = response.css('img')
+        for img_elem in img_elements:
+            img_url = img_elem.css('::attr(src)').get() or img_elem.css('::attr(data-src)').get()
+            if not img_url:
+                continue
+            
+            full_url = urljoin(response.url, img_url)
+            alt_text = img_elem.css('::attr(alt)').get()
+            width = img_elem.css('::attr(width)').get()
+            height = img_elem.css('::attr(height)').get()
+            
+            dimensions = None
+            if width and height:
+                try:
+                    dimensions = (int(width), int(height))
+                except (ValueError, TypeError):
+                    pass
+            
+            self.crawl_logger.log_image(full_url, response.url, dimensions=dimensions, alt_text=alt_text)
+            images.append({
+                "url": full_url,
+                "type": "img_tag",
+                "alt_text": alt_text,
+                "dimensions": dimensions
+            })
+
+        style_images = response.css('*::attr(style)').re(r'url\(["\']?([^"\')]+)["\']?\)')
+        for src in style_images:
+            full_url = urljoin(response.url, src)
+            self.crawl_logger.log_image(full_url, response.url, format_type="css_background")
+            images.append({
+                "url": full_url,
+                "type": "css_background",
+                "alt_text": None,
+                "dimensions": None
+            })
+        
+        return images
 
     def closed(self, reason):
         final_package = {
@@ -995,9 +1653,13 @@ class SearchSpider(scrapy.Spider):
                 "inbound_links": dict(crawl_stats["inbound_links"]),
                 "content_types": dict(crawl_stats["content_types"]),
                 "broken_links": crawl_stats["broken_links"],
-                "images_found": crawl_stats["images_found"]
+                "images_found": crawl_stats["images_found"],
+                "path_map": dict(self.path_map)
             }
         }
+
+        if not self.manager_dict:
+            crawl_stats["path_map"] = dict(self.path_map)
         
         if self.parent_pid:
             try:
@@ -1023,7 +1685,7 @@ class SearchSpider(scrapy.Spider):
             crawl_stats["broken_links"].append(failure.request.url)
 
 
-def run_crawler_process(start_urls, on_site_only, max_depth, max_pages, content_filter, url_include, url_exclude, file_types, image_only, cookies, manager_dict, parent_pid):
+def run_crawler_process(start_urls, on_site_only, max_depth, max_pages, content_filter, url_include, url_exclude, file_types, image_only, cookies, manager_dict, parent_pid, proxy=None):
     """
     Runs a single Scrapy crawler process. Used by run_discord_host.
     """
@@ -1063,7 +1725,8 @@ def run_crawler_process(start_urls, on_site_only, max_depth, max_pages, content_
                   image_only=image_only,
                   cookies=cookies,
                   manager_dict=manager_dict,
-                  parent_pid=parent_pid)
+                  parent_pid=parent_pid,
+                  proxy=proxy)
     
     try:
         process.start(stop_after_crawl=True) 
@@ -1079,7 +1742,7 @@ def run_crawler_process(start_urls, on_site_only, max_depth, max_pages, content_
         pass
 
 
-def run_local_crawler(start_urls, on_site_only=False, max_depth=0, max_pages=0, content_filter=None, url_include=None, url_exclude=None, file_types=None, image_only=False, cookies=None, threads=6):
+def run_local_crawler(start_urls, on_site_only=False, max_depth=0, max_pages=0, content_filter=None, url_include=None, url_exclude=None, file_types=None, image_only=False, cookies=None, threads=6, proxy=None):
     
     max_depth_setting = max_depth if max_depth > 0 else 0
     max_pages_setting = max_pages if max_pages > 0 else 0
@@ -1100,7 +1763,7 @@ def run_local_crawler(start_urls, on_site_only=False, max_depth=0, max_pages=0, 
     
     process = CrawlerProcess(settings=settings)
     
-    process.crawl(SearchSpider, start_urls=start_urls, on_site_only=on_site_only, max_depth=max_depth_setting, max_pages=max_pages_setting, content_filter=content_filter, url_include=url_include, url_exclude=url_exclude, file_types=file_types, image_only=image_only, cookies=cookies, manager_dict=None, parent_pid=None)
+    process.crawl(SearchSpider, start_urls=start_urls, on_site_only=on_site_only, max_depth=max_depth_setting, max_pages=max_pages_setting, content_filter=content_filter, url_include=url_include, url_exclude=url_exclude, file_types=file_types, image_only=image_only, cookies=cookies, manager_dict=None, parent_pid=None, proxy=proxy)
     
     try:
         process.start()
@@ -1324,9 +1987,10 @@ def parse_crawl_command(command_string, default_params):
                 params['file_type'] = value if value.upper() != 'N/A' else None
             elif key == "image_only":
                 params['image_only'] = value.lower() in ['yes', 'true', '1']
+            elif key == "proxy":
+                params['proxy'] = value if value.upper() != 'N/A' else None
                 
     return url, params
-            # Simply the help message for the discord bot, no steal plz
 async def discord_crawl_help(message, limits):
     help_message = (
         "**Web Crawler Command Help**\n"
@@ -1424,7 +2088,7 @@ def run_discord_host(token):
                     p = multiprocessing.Process(target=run_crawler_process, args=(
                         [url], params['site_only'], params['depth'], params['pages'], 
                         params['filter'], params['include_pattern'], params['exclude_pattern'], 
-                        params['file_type'], params['image_only'], None, manager_dict, parent_pid
+                        params['file_type'], params['image_only'], None, manager_dict, parent_pid, params.get('proxy')
                     ))
                     p.start()
                     
@@ -1510,6 +2174,9 @@ def run_discord_host(token):
 
 
 def show_statistics():
+    global collected_data, crawl_stats
+    print(f"[DEBUG] show_statistics - collected_data length: {len(collected_data)}")
+    print(f"[DEBUG] crawl_stats pages_crawled: {crawl_stats.get('pages_crawled', 'N/A')}")
     print(_get_stats_text(crawl_stats))
 
 def show_link_analysis():
@@ -1517,12 +2184,17 @@ def show_link_analysis():
 
 def generate_sitemap():
     global collected_data
+    print(f"[DEBUG] collected_data length: {len(collected_data)}")
+    if collected_data:
+        print(f"[DEBUG] First item keys: {list(collected_data[0].keys())}")
     print(_generate_sitemap_text(collected_data))
 
 
 def export_data(to_file=False, filename="exported_data.dat"):
+    global collected_data
+    print(f"[DEBUG] export_data - collected_data length: {len(collected_data)}")
     if not collected_data:
-        print("No data to export.")
+        print("No data to export. Please run a crawl first.")
         return
     export_package = {
         "data": collected_data,
@@ -1627,6 +2299,133 @@ def export_images_with_metadata(filename="images_metadata.json"):
     except Exception as e:
         print(f"Error writing to file '{filename}': {e}")
 
+def show_js_results(js_results):
+    """Display JS Runner results in a formatted way."""
+    if not js_results:
+        print("No JS Runner results available.")
+        return
+    
+    print("\n=== JS RUNNER RESULTS ===\n")
+    
+    logs = []
+    errors = []
+    warnings = []
+    data_items = []
+    other = []
+    
+    for item in js_results:
+        if isinstance(item, dict):
+            if 'silky_results' in item:
+                print(f"\n--- URL: {item.get('url', 'Unknown')} ---")
+                for subitem in item.get('silky_results', []):
+                    result_type = subitem.get('type', 'unknown')
+                    if result_type == 'log':
+                        logs.append(subitem)
+                    elif result_type == 'error':
+                        errors.append(subitem)
+                    elif result_type == 'warn':
+                        warnings.append(subitem)
+                    elif result_type == 'data':
+                        data_items.append(subitem)
+                    else:
+                        other.append(subitem)
+    
+    print(f"\nTotal Results: {len(js_results)}")
+    print(f"  Logs: {len(logs)}")
+    print(f"  Errors: {len(errors)}")
+    print(f"  Warnings: {len(warnings)}")
+    print(f"  Data Items: {len(data_items)}")
+    print(f"  Other: {len(other)}")
+    
+    if errors:
+        print("\n--- ERRORS ---")
+        for err in errors[:10]:  # Limit to first 10
+            print(f"  [{err.get('timestamp', 'N/A')}] {err.get('message', 'No message')}")
+            if err.get('url'):
+                print(f"    URL: {err['url']}")
+    
+    if warnings:
+        print("\n--- WARNINGS ---")
+        for warn in warnings[:10]:
+            print(f"  [{warn.get('timestamp', 'N/A')}] {warn.get('message', 'No message')}")
+    
+    if data_items:
+        print("\n--- DATA COLLECTED ---")
+        for item in data_items[:10]:
+            print(f"  [{item.get('timestamp', 'N/A')}]")
+            data = item.get('data', {})
+            if isinstance(data, dict):
+                for key, value in list(data.items())[:5]:  
+                    print(f"    {key}: {value}")
+            else:
+                print(f"    {data}")
+    
+    if logs:
+        print("\n--- LOGS (first 10) ---")
+        for log in logs[:10]:
+            print(f"  [{log.get('timestamp', 'N/A')}] {log.get('message', 'No message')}")
+    
+    print("\n")
+
+def export_js_results(js_results, filename=None):
+    """Export JS Runner results to JSON file."""
+    if not js_results:
+        print("No JS Runner results to export.")
+        return
+    
+    if not filename:
+        filename = input("Export filename [js_runner_results.json]: ").strip() or "js_runner_results.json"
+    
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(js_results, f, indent=2, ensure_ascii=False)
+        print(f"Successfully exported {len(js_results)} JS Runner results to '{filename}'")
+    except Exception as e:
+        print(f"Error exporting JS results: {e}")
+
+def build_tree(path_map):
+    root = None
+    for url, path in path_map.items():
+        if len(path) == 1:
+            root = url
+            break
+    if not root:
+        return None
+    tree = {root: {}}
+    for url, path in path_map.items():
+        if url == root:
+            continue
+        current = tree[root]
+        for p in path[1:]:
+            if p not in current:
+                current[p] = {}
+            current = current[p]
+    return tree
+
+def print_tree(tree, prefix=""):
+    if not tree:
+        return
+    items = list(tree.items())
+    for i, (url, children) in enumerate(items):
+        is_last = i == len(items) - 1
+        connector = "└── " if is_last else "├── "
+        print(f"{prefix}{connector}{url}")
+        extension = "    " if is_last else "│   "
+        print_tree(children, prefix + extension)
+
+def generate_tree():
+    global crawl_stats
+    path_map = crawl_stats.get("path_map", {})
+    if not path_map:
+        print("No path map available. Tree requires crawl data with path tracking.")
+        return
+    tree = build_tree(path_map)
+    if tree:
+        print("Crawl Tree:")
+        print_tree(tree)
+    else:
+        print("Could not build tree.")
+
 def import_data(data_string):
     try:
         decoded = base64.b64decode(data_string.encode("utf-8"))
@@ -1635,15 +2434,17 @@ def import_data(data_string):
         if isinstance(imported, dict) and "data" in imported:
             collected_data.clear()
             collected_data.extend(imported["data"])
-            
+
             global crawl_stats
             imported_stats = imported.get("stats", {})
             crawl_stats["pages_crawled"] = imported_stats.get("pages_crawled", len(collected_data))
             crawl_stats["errors"] = imported_stats.get("errors", 0)
             crawl_stats["content_types"] = Counter(imported_stats.get("content_types", {}))
             crawl_stats["images_found"] = imported_stats.get("images_found", 0)
-            crawl_stats["start_time"] = datetime.now() 
-            
+            crawl_stats["link_map"] = defaultdict(list, imported_stats.get("link_map", {}))
+            crawl_stats["path_map"] = defaultdict(list, imported_stats.get("path_map", {}))
+            crawl_stats["start_time"] = datetime.now()
+
             print(f"Imported {len(collected_data)} entries with metadata.")
         else:
             collected_data.clear()
@@ -1669,13 +2470,13 @@ def search_data(query):
     for d in collected_data:
         score = 0
         if 'content' in d:
-            content_lower = d["content"].lower()
+            content_lower = d.get("content", "").lower()
             title_lower = d.get("title", "").lower()
             if query_lower in title_lower:
                 score += 10
             score += content_lower.count(query_lower)
             for h1 in d.get("h1_tags", []):
-                if query_lower in h1.lower():
+                if h1 and isinstance(h1, str) and query_lower in h1.lower():
                     score += 5
         elif d.get('type') == 'image':
             if query_lower in d.get('url', '').lower():
@@ -1684,7 +2485,7 @@ def search_data(query):
             scored_results.append((score, d))
     scored_results.sort(reverse=True, key=lambda x: x[0])
     if not scored_results:
-        urls = [d["url"] for d in collected_data]
+        urls = [d["url"] for d in collected_data if "url" in d]
         close = get_close_matches(query, urls, n=5)
         if close:
             print("\nNo direct match, but maybe:")
@@ -1698,7 +2499,7 @@ def search_data(query):
             if 'title' in r:
                 title = r.get('title', 'No title')
                 print(f"{i}. [{score} pts] {title}")
-                print(f" {r['url']}\an")
+                print(f" {r['url']}\n")
             elif r.get('type') == 'image':
                 print(f"{i}. [{score} pts] [IMAGE] {r['url']}")
                 print(f" Source: {r.get('source_page', 'Unknown')}\n")
@@ -1706,15 +2507,69 @@ def search_data(query):
                 print(f"{i}. [{score} pts] {r['url']}\n")
 
 
+def show_info_for_url(url, logs_data):
+    print(f"\n--- Log Info for {url} ---")
+    
+    page_entries = [p for p in logs_data.get("pages", []) if p["url"] == url]
+    
+    if not page_entries:
+        print("No crawl data found for this exact URL.")
+        all_urls = [p["url"] for p in logs_data.get("pages", [])]
+        close_matches = get_close_matches(url, all_urls, n=3)
+        if close_matches:
+            print("Did you mean one of these?")
+            for match in close_matches:
+                print(f" - {match}")
+        return
+
+    for entry in page_entries:
+        print(f"\n- Page Visit at {entry['timestamp']}")
+        print(f"  - Title: {entry.get('title', 'N/A')}")
+        
+        
+        # Images
+        images = [i for i in logs_data.get("images", []) if i["source_page"] == url]
+        if images:
+            print(f"  - Images Found ({len(images)}):")
+            for img in images:
+                print(f"    - {img['url']}")
+        
+        # JS
+        scripts = [s for s in logs_data.get("javascript", []) if s["page_url"] == url]
+        if scripts:
+            print(f"  - Scripts Found ({len(scripts)}):")
+            for script in scripts:
+                if script['script_type'] == 'external':
+                    print(f"    - {script['script_url']}")
+                else:
+                    print(f"    - Inline script ({script.get('content_size_bytes', 'N/A')} bytes)")
+
+        # Network Requests
+        network_reqs = [r for r in logs_data.get("network", []) if url in r.get("url", "")]
+        if network_reqs:
+            print(f"  - Network Requests ({len(network_reqs)}):")
+            for req in network_reqs:
+                print(f"    - {req['method']} {req['url']} - Status: {req['status']}")
+                
+        # API Calls
+        api_calls = [a for a in logs_data.get("api", []) if url in a.get("endpoint", "")]
+        if api_calls:
+            print(f"  - API Calls ({len(api_calls)}):")
+            for call in api_calls:
+                print(f"    - {call['method']} {call['endpoint']} - Status: {call['status_code']}")
+
+    print("\n--- End of Info ---")
+
+
 if __name__ == "__main__":
     multiprocessing.freeze_support()
     
     print("="*60)
     print("SILKY     By Lil Skittle")
-    print("""  / _ \\
-\_\\(_)/_/
- _//o\\\\_ 
-  /   \\""")
+    print("  / _ \\")
+    print("\\_\\(_)/_/")
+    print(" _//o\\\\_ ")
+    print("  /   \\")
     print("="*60)
     
     mode = input("\nEnter mode (crawl / host / import / importfile): ").strip().lower()
@@ -1731,11 +2586,20 @@ if __name__ == "__main__":
         data_str = input("\nPaste exported data string:\n").strip()
         import_data(data_str)
         while True:
-            query = input("\nCommands: search, stats, links, sitemap, export, exportfile, exportlinks, exportimages, exportimagedata, exit\nEnter command or search query: ").strip()
+            query = input("\nCommands: stats, links, tree, sitemap, search, export, exportfile, exportlinks, exportimages, exportimagedata, exit\nEnter command: ").strip()
             if query.lower() == "exit": sys.exit(0)
             elif query.lower() == "stats": show_statistics()
             elif query.lower() == "links": show_link_analysis()
+            elif query.lower() == "tree": generate_tree()
             elif query.lower() == "sitemap": generate_sitemap()
+            elif query.lower().startswith("search "):
+                search_term = query[len("search "):].strip()
+                if search_term:
+                    search_data(search_term)
+                else:
+                    print("Please provide a search term after 'search'.")
+            elif query.lower() == "search":
+                print("Please provide a search term after 'search'.")
             elif query.lower() == "export": export_data()
             elif query.lower() == "exportlinks": export_urls_to_file()
             elif query.lower() == "exportimages": export_images_to_file()
@@ -1743,17 +2607,26 @@ if __name__ == "__main__":
             elif query.lower() == "exportfile":
                 fn = input("Enter filename: ").strip() or "exported_data.dat"
                 export_data(to_file=True, filename=fn)
-            else: search_data(query)
+            else:
+                print(f"Unknown command: '{query}'")
 
     elif mode == "importfile":
         filename = input("Enter filename to import (e.g. exported_data.dat): ").strip()
         import_file(filename)
         while True:
-            query = input("\nCommands: search, stats, links, sitemap, export, exportfile, exportlinks, exportimages, exportimagedata, exit\nEnter command or search query: ").strip()
+            query = input("\nCommands: stats, links, sitemap, search, export, exportfile, exportlinks, exportimages, exportimagedata, exit\nEnter command: ").strip()
             if query.lower() == "exit": sys.exit(0)
             elif query.lower() == "stats": show_statistics()
             elif query.lower() == "links": show_link_analysis()
             elif query.lower() == "sitemap": generate_sitemap()
+            elif query.lower().startswith("search "):
+                search_term = query[len("search "):].strip()
+                if search_term:
+                    search_data(search_term)
+                else:
+                    print("Please provide a search term after 'search'.")
+            elif query.lower() == "search":
+                print("Please provide a search term after 'search'.")
             elif query.lower() == "export": export_data()
             elif query.lower() == "exportlinks": export_urls_to_file()
             elif query.lower() == "exportimages": export_images_to_file()
@@ -1761,7 +2634,8 @@ if __name__ == "__main__":
             elif query.lower() == "exportfile":
                 fn = input("Enter filename: ").strip() or "exported_data.dat"
                 export_data(to_file=True, filename=fn)
-            else: search_data(query)
+            else:
+                print(f"Unknown command: '{query}'")
 
     else:
         print("\n--- CRAWL MODE ---")
@@ -1773,29 +2647,56 @@ if __name__ == "__main__":
         
         print("\n--- CRAWLER ENGINE SELECTION ---")
         if PLAYWRIGHT_AVAILABLE:
-            engine = input("Choose crawler engine (scrapy/playwright) [scrapy]: ").strip().lower()
-            if engine not in ['scrapy', 'playwright']:
-                engine = 'scrapy'
+            engine_choice = input("Choose engine (playwright / scrapy) [playwright]: ").strip().lower()
+            engine = 'playwright' if engine_choice != 'scrapy' else 'scrapy'
         else:
             engine = 'scrapy'
             print("Playwright not installed. Using Scrapy (install with: pip install playwright)")
         
         network_logging_config = None
         page_timeout = 15000
+        log_images = True
+        log_scripts = True
+        log_cookies = True
         if engine == 'playwright':
             network_logging_config = NetworkLoggingConfig.from_user_input()
-            
+
             print("\n--- PAGE TIMEOUT CONFIGURATION ---")
             print("Timeout for page load (in seconds). Lower = faster but may miss slow sites.")
             print("Recommended: 10-30 seconds. Fast sites: 5-10s, Slow sites: 20-30s")
             timeout_input = input("Page timeout in seconds [15]: ").strip()
             if timeout_input.isdigit():
-                page_timeout = int(timeout_input) * 1000  # Convert to milliseconds
+                page_timeout = int(timeout_input) * 1000  # miliseconds!!!!!!!!!!
             else:
                 page_timeout = 15000
+
+            print("\n--- LOGGING TOGGLES ---")
+            log_images_input = input("Log images? (yes/no) [yes]: ").strip().lower()
+            log_images = log_images_input not in ['no', 'n', 'false', '0']
+
+            log_scripts_input = input("Log scripts? (yes/no) [yes]: ").strip().lower()
+            log_scripts = log_scripts_input not in ['no', 'n', 'false', '0']
+
+            log_cookies_input = input("Log automatically generated cookies? (yes/no) [yes]: ").strip().lower()
+            log_cookies = log_cookies_input not in ['no', 'n', 'false', '0']
         
         on_site = input(f"On Site Crawl only? (yes/no) [yes]: ").strip().lower()
         on_site_only = on_site in ['yes','y','true','1'] or not on_site
+        
+        print("\n--- FORCE DOMAIN (OPTIONAL) ---")
+        print("Force crawler to stay within a specific domain/subdomain/path pattern.")
+        print("Examples:")
+        print("  - https://test.example.com/guide/* (stay on test.example.com under /guide/)")
+        print("  - https://example.com/* (stay on example.com)")
+        print("  - https://*.example.com/* (stay on any subdomain of example.com)")
+        force_domain_input = input("Force domain pattern (or leave blank): ").strip()
+        force_domain = force_domain_input if force_domain_input else None
+        
+        print("\n--- STOP-ON URL (OPTIONAL) ---")
+        print("Crawler will stop when it reaches this specific URL.")
+        print("Example: Start at https://example.com and stop at https://test.com")
+        stop_on_url_input = input("Stop-on URL (or leave blank): ").strip()
+        stop_on_url = stop_on_url_input if stop_on_url_input else None
         
         max_depth_input = input("Max depth (0 for no limit) [0]: ").strip()
         max_depth = int(max_depth_input) if max_depth_input else 0
@@ -1825,6 +2726,42 @@ if __name__ == "__main__":
         
         if cookies:
             print(f"Parsed {len(cookies)} cookie(s): {list(cookies.keys())}")
+
+        print("\n--- PROXY CONFIGURATION ---")
+        print("Enter proxy address if needed (e.g., http://user:pass@host:port or socks5://host:port).")
+        proxy_input = input("Proxy (or leave blank): ").strip() or None
+        
+        js_runner = None
+        if engine == 'playwright':
+            print("\n--- JS RUNNER (OPTIONAL) ---")
+            print("Run custom JavaScript on every page. JS can interact with Silky via window.Silky API.")
+            print("Options:")
+            print("  1. Inline script (type JavaScript directly)")
+            print("  2. Script file (path to .js file)")
+            print("  3. Skip (no JS Runner)")
+            js_choice = input("Choose option (1/2/3) [3]: ").strip()
+            
+            if js_choice == '1':
+                print("\nEnter JavaScript (end with empty line):")
+                script_lines = []
+                while True:
+                    line = input()
+                    if not line:
+                        break
+                    script_lines.append(line)
+                if script_lines:
+                    js_runner = JSRunner(script='\n'.join(script_lines))
+                    print(f"[JS RUNNER] Loaded {len(script_lines)} lines of JavaScript")
+            
+            elif js_choice == '2':
+                js_file = input("Enter path to .js file: ").strip()
+                if js_file:
+                    js_runner = JSRunner(script_file=js_file)
+                    if js_runner.script:
+                        print(f"[JS RUNNER] Loaded script from {js_file}")
+                    else:
+                        print(f"[JS RUNNER] Failed to load {js_file}")
+                        js_runner = None
         
         use_discord = input("\nSend updates to Discord Webhook? (yes/no) [no]: ").strip().lower()
         if use_discord in ['yes','y','true','1']:
@@ -1850,20 +2787,45 @@ if __name__ == "__main__":
                     url_exclude=url_exclude,
                     image_only=image_only,
                     network_logging_config=network_logging_config,
-                    page_timeout=page_timeout
+                    page_timeout=page_timeout,
+                    proxy=proxy_input,
+                    cookies=cookies,
+                    log_images=log_images,
+                    log_scripts=log_scripts,
+                    log_cookies=log_cookies,
+                    global_crawl_stats=crawl_stats,
+                    force_domain=force_domain,
+                    stop_on_url=stop_on_url,
+                    js_runner=js_runner
                 )
                 result = crawler.run(start_urls)
-                
-                if result:
-                    collected_data.extend(result["data"])
-                    crawl_stats.update(result["stats"])
             
             else:
+                result = None
                 run_local_crawler(start_urls, on_site_only, max_depth, max_pages, content_filter, 
-                                url_include, url_exclude, file_types, image_only, cookies, threads)
+                                url_include, url_exclude, file_types, image_only, cookies, threads, proxy=proxy_input)
         
         except KeyboardInterrupt:
             print("\n\n[STOP] Crawl interrupted by user (Ctrl+C). Showing partial results.")
+            if engine == 'playwright' and 'crawler' in locals():
+                result = {
+                    "data": crawler.collected_data,
+                    "stats": crawler.stats,
+                    "logs": crawler.logger.get_summary()
+                }
+            else:
+                result = None
+        
+        if engine == 'playwright' and result is not None:
+            print(f"\n[DEBUG] result type: {type(result)}")
+            print(f"[DEBUG] result is None: {result is None}")
+            print(f"[DEBUG] result keys: {result.keys()}")
+            print(f"[DEBUG] result['data'] length: {len(result['data'])}")
+            print(f"[DEBUG] collected_data BEFORE extend: {len(collected_data)}")
+            collected_data.extend(result["data"])
+            print(f"[DEBUG] collected_data AFTER extend: {len(collected_data)}")
+            crawl_stats.update(result["stats"])
+            print(f"\n[INFO] Collected {len(collected_data)} pages of data")
 
         show_statistics()
         
@@ -1873,15 +2835,29 @@ if __name__ == "__main__":
             logger.export_logs(log_filename)
         
         while True:
-            query = input("\nCommands: search, stats, links, sitemap, export, exportfile, exportlinks, exportimages, exportimagedata, exportlogs, exit\nEnter command or search query: ").strip()
+            query = input("\nCommands: stats, links, tree, sitemap, info, search, export, exportfile, exportlinks, exportimages, exportimagedata, exportlogs, jsresults, exportjs, exit\nEnter command: ").strip()
             if query.lower() == "exit":
                 sys.exit(0)
             elif query.lower() == "stats":
                 show_statistics()
             elif query.lower() == "links":
                 show_link_analysis()
+            elif query.lower() == "tree":
+                generate_tree()
             elif query.lower() == "sitemap":
                 generate_sitemap()
+            elif query.lower() == "info":
+                url_to_find = input("Enter the URL to get info for: ").strip()
+                show_info_for_url(url_to_find, logger.logs)
+            elif query.lower().startswith("search"):
+                if engine != 'scrapy':
+                    print("Search command is only available for the Scrapy engine.")
+                else:
+                    search_term = query[len("search "):].strip()
+                    if search_term:
+                        search_data(search_term)
+                    else:
+                        print("Please provide a search term after 'search'.")
             elif query.lower() == "export":
                 export_data()
             elif query.lower() == "exportlinks":
@@ -1893,10 +2869,20 @@ if __name__ == "__main__":
             elif query.lower() == "exportlogs":
                 log_filename = input("Log filename [crawler_logs.json]: ").strip() or "crawler_logs.json"
                 logger.export_logs(log_filename)
+            elif query.lower() == "jsresults":
+                if engine == 'playwright' and result and 'js_runner_results' in result:
+                    show_js_results(result['js_runner_results'])
+                else:
+                    print("No JS Runner results available.")
+            elif query.lower() == "exportjs":
+                if engine == 'playwright' and result and 'js_runner_results' in result:
+                    export_js_results(result['js_runner_results'])
+                else:
+                    print("No JS Runner results to export.")
             elif query.lower() == "exportfile":
                 filename = input("Enter filename to save (default: exported_data.dat): ").strip() or "exported_data.dat"
                 export_data(to_file=True, filename=filename)
             else:
-                search_data(query)
+                print(f"Unknown command: '{query}'")
                 # Made by Lil Skittle, i am not responsible for any damage caused with this (:
                 # Long Live Silky
